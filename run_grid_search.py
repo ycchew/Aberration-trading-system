@@ -6,9 +6,16 @@ run_grid_search.py — Aberration ETF System: Parameter & Portfolio Grid Search
 Searches all C(n, k) ETF combinations (default k=5) from the standard ~35-ETF
 universe using the Aberration breakout strategy (Keith Fitschen, 1986).
 
-For each combination the equal-weight portfolio CAGR, Sharpe, max drawdown,
-Calmar, and annualised volatility are evaluated.  Results are ranked by Sharpe
-ratio and the best combinations are printed and saved.
+The data is split chronologically: the first *train_frac* (default 70%) is used
+as the in-sample (IS) period for combo selection; the remaining 30% is the
+out-of-sample (OOS) period reported alongside but never used for ranking.
+
+Per-combo returns use an inner join on the tickers' live histories, so
+late-starting ETFs are not zero-padded.  CAGR is annualised over the actual
+joint trading-day count for each combo.
+
+Results are ranked by in-sample Sharpe ratio; the best combinations are printed
+and saved.
 
 Usage
 -----
@@ -16,16 +23,18 @@ Usage
     python run_grid_search.py --start 2015-01-01 --min-cagr 0.12 --top-n 15
     python run_grid_search.py --long-short --period 100 --std-mult 2.5
     python run_grid_search.py --no-vol-filter --top-n 30
+    python run_grid_search.py --train-frac 0.8
 
 Arguments
 ---------
     --start         ISO date for backtest start              [default: 2010-01-01]
-    --min-cagr      Minimum CAGR to keep a combination       [default: 0.10]
+    --min-cagr      Minimum in-sample CAGR                  [default: 0.10]
     --top-n         Number of top results to display         [default: 20]
     --long-short    Enable long+short mode (default: long-only)
     --period        SMA / StdDev lookback period             [default: 80]
     --std-mult      Std-dev multiplier for both bands        [default: 2.0]
     --no-vol-filter Disable the 20-day ATR volatility filter
+    --train-frac    Fraction of history used as in-sample   [default: 0.70]
 """
 
 from __future__ import annotations
@@ -59,7 +68,7 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=0.10,
         metavar="FLOAT",
-        help="Minimum portfolio CAGR required to include a combo in results",
+        help="Minimum in-sample portfolio CAGR required to include a combo",
     )
     parser.add_argument(
         "--top-n",
@@ -94,6 +103,13 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="Disable the 20-day ATR volatility filter",
     )
+    parser.add_argument(
+        "--train-frac",
+        type=float,
+        default=0.70,
+        metavar="FLOAT",
+        help="Fraction of date history used as in-sample (0 < train_frac < 1)",
+    )
     return parser.parse_args()
 
 
@@ -117,7 +133,8 @@ def _print_banner(args: argparse.Namespace) -> None:
     print(f"    Start date   : {args.start}")
     print(f"    Mode         : {'Long-Short' if args.long_short else 'Long-Only (ETF)'}")
     print(f"    Vol filter   : {'Disabled' if args.no_vol_filter else 'Enabled (20-day ATR)'}")
-    print(f"    Min CAGR     : {args.min_cagr:.1%}")
+    print(f"    Min IS CAGR  : {args.min_cagr:.1%}")
+    print(f"    Train/Test   : {args.train_frac:.0%} in-sample / {1 - args.train_frac:.0%} out-of-sample")
     print(f"    Top-N display: {args.top_n}")
     print(sep)
     print()
@@ -143,12 +160,6 @@ def main() -> None:
         _HAS_TABULATE = True
     except ImportError:
         _HAS_TABULATE = False
-
-    try:
-        from tqdm import tqdm as _tqdm
-        _HAS_TQDM = True
-    except ImportError:
-        _HAS_TQDM = False
 
     # ------------------------------------------------------------------
     # Ensure output directory exists
@@ -187,9 +198,10 @@ def main() -> None:
 
     gs_config = GridSearchConfig(
         min_cagr=args.min_cagr,
-        max_results=max(args.top_n * 5, 200),  # Keep a generous buffer for CSV
+        max_results=max(args.top_n * 5, 200),
         n_etfs_per_combo=5,
         transaction_cost=ab_params.transaction_cost,
+        train_frac=args.train_frac,
     )
 
     # ------------------------------------------------------------------
@@ -200,21 +212,29 @@ def main() -> None:
     print("Running grid search...")
     results_df = gs.run(data_dict, verbose=True)
 
+    # Print IS / OOS date ranges
+    if getattr(gs, "train_start_date", None) is not None:
+        print(f"  In-sample    : {gs.train_start_date.strftime('%Y-%m-%d')} → "
+              f"{gs.train_end_date.strftime('%Y-%m-%d')}")
+    if getattr(gs, "oos_start_date", None) is not None:
+        print(f"  Out-of-sample: {gs.oos_start_date.strftime('%Y-%m-%d')} → "
+              f"{gs.oos_end_date.strftime('%Y-%m-%d')}")
+
     # ------------------------------------------------------------------
     # 4. Handle the case where no combo passes min_cagr
     # ------------------------------------------------------------------
     if results_df is None or results_df.empty:
         print(
-            f"\n[WARN] No combination achieved CAGR >= {args.min_cagr:.1%}.\n"
-            f"       Showing top 10 by Sharpe with no CAGR floor.\n"
+            f"\n[WARN] No combination achieved IS CAGR >= {args.min_cagr:.1%}.\n"
+            f"       Showing top 10 by IS Sharpe with no CAGR floor.\n"
         )
-        # Re-run without the CAGR filter
         gs_fallback = GridSearch(
             aberration_params=ab_params,
             config=GridSearchConfig(
                 min_cagr=-999.0,
                 max_results=10,
                 n_etfs_per_combo=5,
+                train_frac=args.train_frac,
             ),
         )
         results_df = gs_fallback.run(data_dict, verbose=False)
@@ -227,31 +247,53 @@ def main() -> None:
     # ------------------------------------------------------------------
     top_df = results_df.head(args.top_n).copy()
 
-    print(f"\nTop {min(args.top_n, len(top_df))} ETF Combinations (sorted by Sharpe)\n")
+    print(f"\nTop {min(args.top_n, len(top_df))} ETF Combinations (sorted by IS Sharpe)\n")
 
-    # Build display rows
+    def _fv(val, fmt: str) -> str:
+        """Format val with fmt, or return 'N/A' if NaN/None."""
+        if val is None:
+            return "N/A"
+        try:
+            if np.isnan(float(val)):
+                return "N/A"
+        except (TypeError, ValueError):
+            pass
+        return fmt.format(val)
+
     display_rows = []
     for rank, (_, row) in enumerate(top_df.iterrows(), start=1):
-        etfs_str = " | ".join(row["etfs"]) if isinstance(row["etfs"], (list, tuple)) else str(row["etfs"])
+        etfs_str = (
+            " | ".join(row["etfs"])
+            if isinstance(row["etfs"], (list, tuple))
+            else str(row["etfs"])
+        )
         display_rows.append([
             rank,
             etfs_str,
-            f"{row['cagr']:.2%}",
-            f"{row['sharpe']:.3f}",
-            f"{row['max_drawdown']:.2%}",
-            f"{row['calmar']:.3f}",
-            f"{row['annual_vol']:.2%}",
-            f"{row['n_trades_avg']:.1f}",
+            _fv(row.get("is_cagr"),         "{:.2%}"),
+            _fv(row.get("is_sharpe"),        "{:.3f}"),
+            _fv(row.get("oos_cagr"),         "{:.2%}"),
+            _fv(row.get("oos_sharpe"),       "{:.3f}"),
+            _fv(row.get("oos_max_drawdown"), "{:.2%}"),
+            _fv(row.get("max_drawdown"),     "{:.2%}"),
+            _fv(row.get("annual_vol"),       "{:.2%}"),
+            _fv(row.get("n_trades_avg"),     "{:.1f}"),
         ])
 
-    headers = ["Rank", "ETFs", "CAGR", "Sharpe", "MaxDD", "Calmar", "AnnVol", "AvgTrades"]
+    headers = [
+        "Rank", "ETFs",
+        "IS_CAGR", "IS_Sharpe",
+        "OOS_CAGR", "OOS_Sharpe", "OOS_MaxDD",
+        "MaxDD", "AnnVol", "Trades",
+    ]
 
     if _HAS_TABULATE:
         print(tabulate(display_rows, headers=headers, tablefmt="rounded_outline"))
     else:
-        # Fallback: manual alignment
-        col_widths = [max(len(str(h)), max((len(str(r[i])) for r in display_rows), default=0))
-                      for i, h in enumerate(headers)]
+        col_widths = [
+            max(len(str(h)), max((len(str(r[i])) for r in display_rows), default=0))
+            for i, h in enumerate(headers)
+        ]
         sep_line = "  " + "  ".join("-" * w for w in col_widths)
         hdr_line = "  " + "  ".join(str(h).ljust(col_widths[i]) for i, h in enumerate(headers))
         print(sep_line)
@@ -266,7 +308,6 @@ def main() -> None:
     # ------------------------------------------------------------------
     csv_path = os.path.join(results_dir, "grid_search_results.csv")
     save_df = results_df.copy()
-    # Flatten tuple column to string for CSV
     if "etfs" in save_df.columns:
         save_df["etfs"] = save_df["etfs"].apply(
             lambda v: " | ".join(v) if isinstance(v, (list, tuple)) else str(v)
@@ -278,13 +319,24 @@ def main() -> None:
     # 7. Per-ETF metrics for the best combination
     # ------------------------------------------------------------------
     best_row = results_df.iloc[0]
-    best_tickers = list(best_row["etfs"]) if isinstance(best_row["etfs"], (list, tuple)) else list(best_row["etfs"])
+    best_tickers = (
+        list(best_row["etfs"])
+        if isinstance(best_row["etfs"], (list, tuple))
+        else list(best_row["etfs"])
+    )
 
     print(f"\n{'=' * 68}")
     print(f"  Best Combination: {' | '.join(best_tickers)}")
-    print(f"  CAGR={best_row['cagr']:.2%}  Sharpe={best_row['sharpe']:.3f}  MaxDD={best_row['max_drawdown']:.2%}")
+    print(f"  IS  CAGR={_fv(best_row.get('is_cagr'), '{:.2%}')}  "
+          f"IS Sharpe={_fv(best_row.get('is_sharpe'), '{:.3f}')}  "
+          f"MaxDD={_fv(best_row.get('max_drawdown'), '{:.2%}')}")
+    oos_c = best_row.get("oos_cagr")
+    if oos_c is not None and not np.isnan(float(oos_c)):
+        print(f"  OOS CAGR={_fv(oos_c, '{:.2%}')}  "
+              f"OOS Sharpe={_fv(best_row.get('oos_sharpe'), '{:.3f}')}  "
+              f"OOS MaxDD={_fv(best_row.get('oos_max_drawdown'), '{:.2%}')}")
     print(f"{'=' * 68}")
-    print("  Individual ETF metrics:\n")
+    print("  Individual ETF metrics (full history):\n")
 
     bt_best = Backtester(ab_params)
     etf_metric_rows = []
@@ -294,8 +346,8 @@ def main() -> None:
             continue
         single = bt_best.run_single(
             close=df_tkr["Close"],
-            high=df_tkr.get("High") if hasattr(df_tkr, "get") else (df_tkr["High"] if "High" in df_tkr.columns else None),
-            low=df_tkr.get("Low")  if hasattr(df_tkr, "get") else (df_tkr["Low"]  if "Low"  in df_tkr.columns else None),
+            high=df_tkr["High"] if "High" in df_tkr.columns else None,
+            low=df_tkr["Low"]   if "Low"  in df_tkr.columns else None,
             ticker=tkr,
         )
         m = single["metrics"]
@@ -313,27 +365,35 @@ def main() -> None:
     if _HAS_TABULATE:
         print(tabulate(etf_metric_rows, headers=etf_headers, tablefmt="simple"))
     else:
-        col_widths = [max(len(str(h)), max((len(str(r[i])) for r in etf_metric_rows), default=0))
-                      for i, h in enumerate(etf_headers)]
+        col_widths = [
+            max(len(str(h)), max((len(str(r[i])) for r in etf_metric_rows), default=0))
+            for i, h in enumerate(etf_headers)
+        ]
         print("  " + "  ".join(str(h).ljust(col_widths[i]) for i, h in enumerate(etf_headers)))
         print("  " + "  ".join("-" * w for w in col_widths))
         for row_vals in etf_metric_rows:
             print("  " + "  ".join(str(v).ljust(col_widths[i]) for i, v in enumerate(row_vals)))
 
     # ------------------------------------------------------------------
-    # 8. Detailed portfolio backtest on best 5-ETF combo
+    # 8. Detailed portfolio backtest on best 5-ETF combo (full history)
     # ------------------------------------------------------------------
     print(f"\n{'=' * 68}")
     print(f"  Detailed Portfolio Backtest — {' | '.join(best_tickers)}")
+    print(f"  (full date range, inner join)")
     print(f"{'=' * 68}")
 
-    close_df = pd.DataFrame({t: data_dict[t]["Close"] for t in best_tickers if t in data_dict})
-    high_df  = pd.DataFrame({t: data_dict[t]["High"]  for t in best_tickers
-                              if t in data_dict and "High" in data_dict[t].columns})
-    low_df   = pd.DataFrame({t: data_dict[t]["Low"]   for t in best_tickers
-                              if t in data_dict and "Low"  in data_dict[t].columns})
+    close_df = pd.DataFrame(
+        {t: data_dict[t]["Close"] for t in best_tickers if t in data_dict}
+    )
+    high_df = pd.DataFrame(
+        {t: data_dict[t]["High"] for t in best_tickers
+         if t in data_dict and "High" in data_dict[t].columns}
+    )
+    low_df = pd.DataFrame(
+        {t: data_dict[t]["Low"] for t in best_tickers
+         if t in data_dict and "Low" in data_dict[t].columns}
+    )
 
-    # Inner-join alignment
     close_df = close_df.dropna(how="any")
     high_df  = high_df.reindex(close_df.index) if not high_df.empty else None
     low_df   = low_df.reindex(close_df.index)  if not low_df.empty  else None
@@ -343,7 +403,7 @@ def main() -> None:
         high_df=high_df if (high_df is not None and not high_df.empty) else None,
         low_df=low_df   if (low_df  is not None and not low_df.empty)  else None,
     )
-    bt_best.print_summary(portfolio, title="Best-Combo Portfolio Summary")
+    bt_best.print_summary(portfolio, title="Best-Combo Portfolio Summary (full history)")
 
     # ------------------------------------------------------------------
     # 9. Save equity curve
@@ -356,12 +416,17 @@ def main() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Lazy import — pandas is needed here but shouldn't block --help
+# Lazy imports — must not block --help
 # ---------------------------------------------------------------------------
 try:
     import pandas as pd
 except ImportError:
     pd = None  # type: ignore
+
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore
 
 if __name__ == "__main__":
     main()

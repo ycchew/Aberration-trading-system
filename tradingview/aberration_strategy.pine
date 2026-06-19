@@ -34,8 +34,9 @@
 //
 // Execution Model
 // ---------------
-// Signals are generated at the CLOSE of day t and executed at the OPEN
-// of day t+1 (bar-close strategy with next-bar fill).
+// Signals are generated at the CLOSE of day t and filled at the CLOSE
+// of the same bar (market-on-close order), matching the Python backtest.
+// process_orders_on_close = true enforces this in Pine.
 //
 // Author  : Aberration Trading System (TradingView implementation)
 // Version : 1.0
@@ -52,7 +53,7 @@ strategy(
      commission_type  = strategy.commission.percent,
      commission_value = 0.1,
      calc_on_every_tick = false,
-     process_orders_on_close = false
+     process_orders_on_close = true
  )
 
 // =============================================================================
