@@ -1,0 +1,265 @@
+// =============================================================================
+// Aberration Trading Strategy — Pine Script v5
+// =============================================================================
+//
+// Based on Keith Fitschen's Aberration system (originally published 1986,
+// documented in "Building Reliable Trading Systems", Wiley, 2013).
+//
+// Core Concept
+// ------------
+// Aberration is a Bollinger-band-style breakout system designed to capture
+// sustained directional moves in liquid markets. Unlike mean-reversion
+// systems, Aberration goes WITH the breakout:
+//
+//   • Middle Band  = N-period SMA of closing prices (default N=80)
+//   • Upper Band   = Middle + std_mult_up × StdDev(close, N)
+//   • Lower Band   = Middle − std_mult_dn × StdDev(close, N)
+//
+// Signal Rules (Long-Only / ETF Mode)
+// ------------------------------------
+//   Long  Entry : close > Upper Band  AND  Volatility Filter passes
+//   Long  Exit  : close < Middle Band
+//
+// Signal Rules (Long-Short Mode)
+// --------------------------------
+//   Short Entry : close < Lower Band  AND  Volatility Filter passes
+//   Short Exit  : close > Middle Band
+//
+// Volatility Filter
+// -----------------
+// Avoids trading during abnormally quiet or violently volatile regimes.
+// The 20-day ATR is compared to its 252-day rolling median:
+//   vol_ratio = ATR(20) / median(ATR(20), 252 days)
+//   Filter passes when: min_vol_ratio ≤ vol_ratio ≤ max_vol_ratio
+//
+// Execution Model
+// ---------------
+// Signals are generated at the CLOSE of day t and filled at the CLOSE
+// of the same bar (market-on-close order), matching the Python backtest.
+// process_orders_on_close = true enforces this in Pine.
+//
+// Author  : Aberration Trading System (TradingView implementation)
+// Version : 1.0
+// =============================================================================
+
+//@version=5
+strategy(
+     title            = "Aberration ETF Strategy",
+     shorttitle       = "Aberration",
+     overlay          = true,
+     initial_capital  = 100000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value= 100,
+     commission_type  = strategy.commission.percent,
+     commission_value = 0.1,
+     calc_on_every_tick = false,
+     process_orders_on_close = true
+ )
+
+// =============================================================================
+// ── INPUT GROUPS ─────────────────────────────────────────────────────────────
+// =============================================================================
+
+// ── Core Parameters ───────────────────────────────────────────────────────────
+var string GRP_CORE = "Core Parameters"
+
+period        = input.int   (80,   "Band Period",           minval=20,  maxval=300,          group=GRP_CORE,
+                              tooltip="Number of bars for SMA and StdDev calculation (Fitschen default: 80)")
+std_mult_up   = input.float (2.0,  "Upper Band Std Mult",   minval=0.5, maxval=5.0, step=0.1, group=GRP_CORE,
+                              tooltip="Standard deviation multiplier for the upper breakout band")
+std_mult_dn   = input.float (2.0,  "Lower Band Std Mult",   minval=0.5, maxval=5.0, step=0.1, group=GRP_CORE,
+                              tooltip="Standard deviation multiplier for the lower breakout band")
+long_only     = input.bool  (true, "Long Only (ETF Mode)",                                   group=GRP_CORE,
+                              tooltip="When enabled, only long trades are taken (suitable for ETFs that cannot be shorted easily)")
+
+// ── Volatility Filter ─────────────────────────────────────────────────────────
+var string GRP_VOL = "Volatility Filter"
+
+use_vol_filter= input.bool  (true, "Enable Volatility Filter",                               group=GRP_VOL,
+                              tooltip="Filter out entries during unusually low or high volatility regimes")
+atr_period    = input.int   (20,   "ATR Period",            minval=5,   maxval=50,           group=GRP_VOL,
+                              tooltip="Lookback for the short-term ATR used in vol ratio calculation")
+vol_lookback  = input.int   (252,  "Vol Lookback Days",     minval=50,  maxval=500,          group=GRP_VOL,
+                              tooltip="Rolling window (bars) for computing the median ATR baseline")
+min_vol_ratio = input.float (0.5,  "Min Vol Ratio",         minval=0.1, maxval=1.0, step=0.05, group=GRP_VOL,
+                              tooltip="ATR / median_ATR must be >= this value to allow an entry")
+max_vol_ratio = input.float (2.0,  "Max Vol Ratio",         minval=1.0, maxval=5.0, step=0.1,  group=GRP_VOL,
+                              tooltip="ATR / median_ATR must be <= this value to allow an entry")
+
+// ── Display ───────────────────────────────────────────────────────────────────
+var string GRP_DISP = "Display"
+
+show_fills    = input.bool  (true, "Show Band Fill",                                          group=GRP_DISP)
+show_signals  = input.bool  (true, "Show Entry / Exit Signals",                               group=GRP_DISP)
+show_table    = input.bool  (true, "Show Info Table",                                         group=GRP_DISP)
+
+// =============================================================================
+// ── BAND CALCULATIONS ────────────────────────────────────────────────────────
+// =============================================================================
+
+mid   = ta.sma  (close, period)
+dev   = ta.stdev(close, period)
+upper = mid + std_mult_up * dev
+lower = mid - std_mult_dn * dev
+
+// =============================================================================
+// ── VOLATILITY FILTER ────────────────────────────────────────────────────────
+// =============================================================================
+
+atr        = ta.atr(atr_period)
+median_atr = ta.percentile_nearest_rank(atr, vol_lookback, 50)
+vol_ratio  = atr / median_atr
+
+// vol_ok is true when either the filter is disabled, or the ratio is in-range
+vol_ok = not use_vol_filter or (vol_ratio >= min_vol_ratio and vol_ratio <= max_vol_ratio)
+
+// =============================================================================
+// ── SIGNAL LOGIC ─────────────────────────────────────────────────────────────
+// =============================================================================
+
+// Long signals
+long_entry  = close > upper and vol_ok and (strategy.position_size <= 0)
+long_exit   = close < mid   and strategy.position_size > 0
+
+// Short signals (disabled in long-only mode)
+short_entry = not long_only and close < lower and vol_ok and strategy.position_size >= 0
+short_exit  = not long_only and close > mid   and strategy.position_size < 0
+
+// =============================================================================
+// ── STRATEGY ORDERS ──────────────────────────────────────────────────────────
+// =============================================================================
+
+if long_entry
+    strategy.entry("Long",  strategy.long)
+
+if long_exit
+    strategy.close("Long", comment="Exit Long (mid cross)")
+
+if short_entry
+    strategy.entry("Short", strategy.short)
+
+if short_exit
+    strategy.close("Short", comment="Exit Short (mid cross)")
+
+// =============================================================================
+// ── BAND PLOTS ───────────────────────────────────────────────────────────────
+// =============================================================================
+
+p_upper = plot(upper, title="Upper Band", color=color.new(color.red,   20), linewidth=1)
+p_mid   = plot(mid,   title="Mid Band",   color=color.new(color.blue,   0), linewidth=2)
+p_lower = plot(lower, title="Lower Band", color=color.new(color.green, 20), linewidth=1)
+
+// Semi-transparent gray fill between upper and lower bands
+fill(p_upper, p_lower,
+     color = show_fills ? color.new(color.gray, 88) : na,
+     title = "Band Fill")
+
+// =============================================================================
+// ── SIGNAL SHAPES ────────────────────────────────────────────────────────────
+// =============================================================================
+
+// Long entry: green triangle pointing up, plotted below the bar
+plotshape(
+     show_signals and long_entry,
+     title    = "Long Entry",
+     style    = shape.triangleup,
+     location = location.belowbar,
+     color    = color.new(color.green, 0),
+     size     = size.small,
+     text     = "L"
+ )
+
+// Long exit: red triangle pointing down, plotted above the bar
+plotshape(
+     show_signals and long_exit,
+     title    = "Long Exit",
+     style    = shape.triangledown,
+     location = location.abovebar,
+     color    = color.new(color.red, 0),
+     size     = size.small,
+     text     = "X"
+ )
+
+// Short entry: orange triangle pointing down, plotted above the bar
+plotshape(
+     show_signals and short_entry and not long_only,
+     title    = "Short Entry",
+     style    = shape.triangledown,
+     location = location.abovebar,
+     color    = color.new(color.orange, 0),
+     size     = size.small,
+     text     = "S"
+ )
+
+// Short exit: purple triangle pointing up, plotted below the bar
+plotshape(
+     show_signals and short_exit and not long_only,
+     title    = "Short Exit",
+     style    = shape.triangleup,
+     location = location.belowbar,
+     color    = color.new(color.purple, 0),
+     size     = size.small,
+     text     = "SX"
+ )
+
+// =============================================================================
+// ── INFO TABLE (top-right, 3 cols × 6 rows) ──────────────────────────────────
+// =============================================================================
+
+if show_table and barstate.islast
+    var table info_tbl = table.new(
+         position   = position.top_right,
+         columns    = 3,
+         rows       = 7,
+         bgcolor    = color.new(color.black, 80),
+         border_width = 1,
+         border_color = color.new(color.gray, 60)
+     )
+
+    // Header row
+    table.cell(info_tbl, 0, 0, "Parameter",  text_color=color.white, text_size=size.small, bgcolor=color.new(color.navy, 40))
+    table.cell(info_tbl, 1, 0, "Value",       text_color=color.white, text_size=size.small, bgcolor=color.new(color.navy, 40))
+    table.cell(info_tbl, 2, 0, "Status",      text_color=color.white, text_size=size.small, bgcolor=color.new(color.navy, 40))
+
+    // Row 1 — Period
+    table.cell(info_tbl, 0, 1, "Period",      text_color=color.silver, text_size=size.small)
+    table.cell(info_tbl, 1, 1, str.tostring(period), text_color=color.yellow, text_size=size.small)
+    table.cell(info_tbl, 2, 1, "bars",        text_color=color.gray,   text_size=size.small)
+
+    // Row 2 — Std Up / Std Dn
+    table.cell(info_tbl, 0, 2, "Std Up / Dn", text_color=color.silver, text_size=size.small)
+    table.cell(info_tbl, 1, 2, str.tostring(std_mult_up, "#.##") + " / " + str.tostring(std_mult_dn, "#.##"),
+               text_color=color.yellow, text_size=size.small)
+    table.cell(info_tbl, 2, 2, "σ mult",      text_color=color.gray,   text_size=size.small)
+
+    // Row 3 — Vol Filter enabled / disabled
+    vol_filter_color = use_vol_filter ? color.new(color.green, 20) : color.new(color.red, 20)
+    table.cell(info_tbl, 0, 3, "Vol Filter",  text_color=color.silver, text_size=size.small)
+    table.cell(info_tbl, 1, 3, use_vol_filter ? "ON" : "OFF",
+               text_color=vol_filter_color, text_size=size.small)
+    table.cell(info_tbl, 2, 3, str.tostring(min_vol_ratio, "#.##") + "–" + str.tostring(max_vol_ratio, "#.##"),
+               text_color=color.gray, text_size=size.small)
+
+    // Row 4 — Mode
+    mode_str  = long_only ? "Long-Only" : "Long-Short"
+    mode_color= long_only ? color.new(color.teal, 10) : color.new(color.orange, 10)
+    table.cell(info_tbl, 0, 4, "Mode",        text_color=color.silver, text_size=size.small)
+    table.cell(info_tbl, 1, 4, mode_str,      text_color=mode_color,   text_size=size.small)
+    table.cell(info_tbl, 2, 4, "ETF/LS",      text_color=color.gray,   text_size=size.small)
+
+    // Row 5 — ATR Ratio
+    atr_ok_color = vol_ok ? color.new(color.green, 20) : color.new(color.red, 20)
+    table.cell(info_tbl, 0, 5, "ATR Ratio",   text_color=color.silver, text_size=size.small)
+    table.cell(info_tbl, 1, 5, str.tostring(vol_ratio, "#.###"),
+               text_color=atr_ok_color, text_size=size.small)
+    table.cell(info_tbl, 2, 5, vol_ok ? "PASS" : "FAIL",
+               text_color=atr_ok_color, text_size=size.small)
+
+    // Row 6 — Position
+    pos_size  = strategy.position_size
+    pos_str   = pos_size > 0 ? "LONG" : pos_size < 0 ? "SHORT" : "FLAT"
+    pos_color = pos_size > 0 ? color.new(color.green, 10) : pos_size < 0 ? color.new(color.red, 10) : color.silver
+    table.cell(info_tbl, 0, 6, "Position",    text_color=color.silver, text_size=size.small)
+    table.cell(info_tbl, 1, 6, pos_str,       text_color=pos_color,    text_size=size.small)
+    table.cell(info_tbl, 2, 6, str.tostring(math.abs(pos_size), "#.##"),
+               text_color=color.gray, text_size=size.small)
